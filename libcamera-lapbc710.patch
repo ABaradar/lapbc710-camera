@@ -1,0 +1,331 @@
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -36,9 +36,10 @@
+ /**
+  * \brief Constructs a DebayerCpu object
+  * \param[in] stats Pointer to the stats object to use
++ * \param[in] lapbc710RgbIr Apply the LAPBC710 RGB-IR remosaic and mounting correction
+  */
+-DebayerCpu::DebayerCpu(std::unique_ptr<SwStatsCpu> stats)
+-	: stats_(std::move(stats))
++DebayerCpu::DebayerCpu(std::unique_ptr<SwStatsCpu> stats, bool lapbc710RgbIr)
++	: stats_(std::move(stats)), lapbc710RgbIr_(lapbc710RgbIr)
+ {
+ 	/*
+ 	 * Reading from uncached buffers may be very slow.
+@@ -286,6 +287,9 @@
+  */
+ int DebayerCpu::getInputConfig(PixelFormat inputFormat, DebayerInputConfig &config)
+ {
++	if (lapbc710RgbIr_ && inputFormat != formats::SGRBG10)
++		return -EINVAL;
++
+ 	BayerFormat bayerFormat =
+ 		BayerFormat::fromPixelFormat(inputFormat);
+ 
+@@ -472,7 +476,19 @@
+ 	if (getInputConfig(inputCfg.pixelFormat, inputConfig_) != 0)
+ 		return -EINVAL;
+ 
+-	if (stats_->configure(inputCfg) != 0)
++	StreamConfiguration bayerCfg = inputCfg;
++	if (lapbc710RgbIr_) {
++		if (inputCfg.size.width < 4 || inputCfg.size.height < 4 ||
++		    inputCfg.size.width % 4 || inputCfg.size.height % 4 ||
++		    inputCfg.stride % 2 || inputCfg.stride / 2 < inputCfg.size.width)
++			return -EINVAL;
++
++		rgbIrSize_ = inputCfg.size;
++		rgbIrBayer_.resize(static_cast<size_t>(inputCfg.stride / 2) * rgbIrSize_.height);
++		bayerCfg.pixelFormat = formats::SRGGB10;
++	}
++
++	if (stats_->configure(bayerCfg) != 0)
+ 		return -EINVAL;
+ 
+ 	const Size &statsPatternSize = stats_->patternSize();
+@@ -506,7 +522,7 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (setDebayerFunctions(inputCfg.pixelFormat, outputCfg.pixelFormat) != 0)
++	if (setDebayerFunctions(bayerCfg.pixelFormat, outputCfg.pixelFormat) != 0)
+ 		return -EINVAL;
+ 
+ 	window_.x = ((inputCfg.size.width - outputCfg.size.width) / 2) &
+@@ -731,6 +747,60 @@
+ 
+ } /* namespace */
+ 
++/*
++ * The LAPBC710 delivers unpacked 10-bit RGB-IR with this repeating tile:
++ *
++ *     I G I G
++ *     G B G R
++ *     I G I G
++ *     G R G B
++ *
++ * Rotate the sensor image 180 degrees as we reconstruct an RGGB mosaic.
++ * Keep measured green pixels and interpolate chroma from nearby samples
++ * of the same color. Infrared samples are excluded from color and stats.
++ */
++void DebayerCpu::remosaicLapbc710(const uint8_t *src)
++{
++	const unsigned int stride = inputConfig_.stride / 2;
++	const unsigned int width = rgbIrSize_.width;
++	const unsigned int height = rgbIrSize_.height;
++	const auto *raw = reinterpret_cast<const uint16_t *>(src);
++	const auto isRed = [](unsigned int x, unsigned int y) {
++		return ((x ^ y) & 2) != 0;
++	};
++
++	for (unsigned int y = 0; y < height; ++y) {
++		const unsigned int sy = height - 1 - y;
++		const auto *row = raw + sy * stride;
++		auto *dst = rgbIrBayer_.data() + y * stride;
++
++		for (unsigned int x = 0; x < width; ++x) {
++			const unsigned int sx = width - 1 - x;
++			if ((x ^ y) & 1) {
++				dst[x] = row[sx];
++			} else if (!(y & 1)) {
++				if (isRed(sx, sy)) {
++					dst[x] = row[sx];
++				} else {
++					const unsigned int left = sx >= 2 ? sx - 2 : sx + 2;
++					const unsigned int right = sx + 2 < width ? sx + 2 : left;
++					dst[x] = (row[left] + row[right] + 1) / 2;
++				}
++			} else {
++				const unsigned int above = sy ? sy - 1 : 1;
++				const unsigned int below = sy + 1;
++				const auto blue = [&](unsigned int line) {
++					unsigned int column = sx + 1;
++					if (isRed(column, line))
++						column = sx ? sx - 1 : sx + 3;
++					return raw[line * stride + column];
++				};
++				dst[x] = (blue(above) + blue(below) + 1) / 2;
++			}
++		}
++	}
++}
++
+ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output, DebayerParams params)
+ {
+ 	timespec frameStartTime;
+@@ -765,12 +835,25 @@
+ 		return;
+ 	}
+ 
++	const uint8_t *src = in.planes()[0].data();
++	if (lapbc710RgbIr_) {
++		if (in.planes()[0].size() < rgbIrBayer_.size() * sizeof(uint16_t)) {
++			LOG(Debayer, Error) << "Short LAPBC710 RGB-IR input buffer";
++			metadata.status = FrameMetadata::FrameError;
++			outputBufferReady.emit(output);
++			inputBufferReady.emit(input);
++			return;
++		}
++		remosaicLapbc710(src);
++		src = reinterpret_cast<const uint8_t *>(rgbIrBayer_.data());
++	}
++
+ 	stats_->startFrame();
+ 
+ 	if (inputConfig_.patternSize.height == 2)
+-		process2(in.planes()[0].data(), out.planes()[0].data());
++		process2(src, out.planes()[0].data());
+ 	else
+-		process4(in.planes()[0].data(), out.planes()[0].data());
++		process4(src, out.planes()[0].data());
+ 
+ 	metadata.planes()[0].bytesused = out.planes()[0].size();
+ 
+--- a/src/libcamera/software_isp/debayer_cpu.h
++++ b/src/libcamera/software_isp/debayer_cpu.h
+@@ -27,7 +27,7 @@
+ class DebayerCpu : public Debayer, public Object
+ {
+ public:
+-	DebayerCpu(std::unique_ptr<SwStatsCpu> stats);
++	DebayerCpu(std::unique_ptr<SwStatsCpu> stats, bool lapbc710RgbIr);
+ 	~DebayerCpu();
+ 
+ 	int configure(const StreamConfiguration &inputCfg,
+@@ -129,6 +129,7 @@
+ 	void setupInputMemcpy(const uint8_t *linePointers[]);
+ 	void shiftLinePointers(const uint8_t *linePointers[], const uint8_t *src);
+ 	void memcpyNextLine(const uint8_t *linePointers[]);
++	void remosaicLapbc710(const uint8_t *src);
+ 	void process2(const uint8_t *src, uint8_t *dst);
+ 	void process4(const uint8_t *src, uint8_t *dst);
+ 
+@@ -146,6 +147,9 @@
+ 	DebayerInputConfig inputConfig_;
+ 	DebayerOutputConfig outputConfig_;
+ 	std::unique_ptr<SwStatsCpu> stats_;
++	const bool lapbc710RgbIr_;
++	Size rgbIrSize_;
++	std::vector<uint16_t> rgbIrBayer_;
+ 	std::vector<uint8_t> lineBuffers_[kMaxLineBuffers];
+ 	unsigned int lineBufferLength_;
+ 	unsigned int lineBufferPadding_;
+--- a/src/libcamera/software_isp/software_isp.cpp
++++ b/src/libcamera/software_isp/software_isp.cpp
+@@ -8,6 +8,7 @@
+ #include "libcamera/internal/software_isp/software_isp.h"
+ 
+ #include <cmath>
++#include <fstream>
+ #include <stdint.h>
+ #include <sys/mman.h>
+ #include <sys/types.h>
+@@ -105,7 +106,10 @@
+ 	}
+ 	stats->statsReady.connect(this, &SoftwareIsp::statsReady);
+ 
+-	debayer_ = std::make_unique<DebayerCpu>(std::move(stats));
++	std::string board;
++	if (sensor->model() == "ov01a1s")
++		std::ifstream("/sys/class/dmi/id/board_name") >> board;
++	debayer_ = std::make_unique<DebayerCpu>(std::move(stats), board == "LAPBC710");
+ 	debayer_->inputBufferReady.connect(this, &SoftwareIsp::inputReady);
+ 	debayer_->outputBufferReady.connect(this, &SoftwareIsp::outputReady);
+ 
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -52,6 +52,20 @@
+ 	double next;
+ 	int32_t &exposure = frameContext.sensor.exposure;
+ 	double &again = frameContext.sensor.gain;
++	int32_t &digital = frameContext.sensor.digitalGain;
++	const auto &config = context.configuration.agc;
++	if (config.digitalGainMax > config.digitalGainMin) {
++		if (exposureMSV > kExposureOptimal + kExposureSatisfactory &&
++		    digital > config.digitalGainMin) {
++			digital = std::max(config.digitalGainMin, digital * 9 / 10);
++			return;
++		}
++		if (exposureMSV < kExposureOptimal - kExposureSatisfactory &&
++		    exposure >= config.exposureMax && again >= config.againMax) {
++			digital = std::min(config.digitalGainMax, digital * 11 / 10);
++			return;
++		}
++	}
+ 
+ 	if (exposureMSV < kExposureOptimal - kExposureSatisfactory) {
+ 		next = exposure * kExpNumeratorUp / kExpDenominator;
+@@ -110,15 +124,13 @@
+ 		context.activeState.blc.level / (256 / SwIspStats::kYHistogramSize);
+ 	const unsigned int histogramSize =
+ 		SwIspStats::kYHistogramSize - blackLevelHistIdx;
+-	const unsigned int yHistValsPerBin = histogramSize / kExposureBinsCount;
+-	const unsigned int yHistValsPerBinMod =
+-		histogramSize / (histogramSize % kExposureBinsCount + 1);
+ 	int exposureBins[kExposureBinsCount] = {};
+ 	unsigned int denom = 0;
+ 	unsigned int num = 0;
+ 
+ 	for (unsigned int i = 0; i < histogramSize; i++) {
+-		unsigned int idx = (i - (i / yHistValsPerBinMod)) / yHistValsPerBin;
++		/* Keep the bin index valid even when very few histogram entries remain. */
++		unsigned int idx = i * kExposureBinsCount / histogramSize;
+ 		exposureBins[idx] += histogram[blackLevelHistIdx + i];
+ 	}
+ 
+--- a/src/ipa/simple/ipa_context.h
++++ b/src/ipa/simple/ipa_context.h
+@@ -24,6 +24,7 @@
+ 	struct {
+ 		int32_t exposureMin, exposureMax;
+ 		double againMin, againMax, againMinStep;
++		int32_t digitalGainMin, digitalGainMax;
+ 	} agc;
+ 	struct {
+ 		std::optional<uint8_t> level;
+@@ -57,6 +58,7 @@
+ 	struct {
+ 		int32_t exposure;
+ 		double gain;
++		int32_t digitalGain;
+ 	} sensor;
+ };
+ 
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -1296,6 +1296,9 @@
+ 		{ V4L2_CID_ANALOGUE_GAIN, { delays.gainDelay, false } },
+ 		{ V4L2_CID_EXPOSURE, { delays.exposureDelay, false } },
+ 	};
++	if (data->sensor_->model() == "ov01a1s" &&
++	    data->sensor_->controls().count(V4L2_CID_DIGITAL_GAIN))
++		params.emplace(V4L2_CID_DIGITAL_GAIN, DelayedControls::ControlParams{ delays.gainDelay, false });
+ 	data->delayedCtrls_ =
+ 		std::make_unique<DelayedControls>(data->sensor_->device(),
+ 						  params);
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -72,6 +72,7 @@
+ 	SwIspStats *stats_;
+ 	std::unique_ptr<CameraSensorHelper> camHelper_;
+ 	ControlInfoMap sensorInfoMap_;
++	bool useDigitalGain_ = false;
+ 
+ 	/* Local parameter storage */
+ 	struct IPAContext context_;
+@@ -91,6 +92,7 @@
+ 			const ControlInfoMap &sensorInfoMap,
+ 			ControlInfoMap *ipaControls)
+ {
++	useDigitalGain_ = settings.sensorModel == "ov01a1s";
+ 	camHelper_ = CameraSensorHelperFactoryBase::create(settings.sensorModel);
+ 	if (!camHelper_) {
+ 		LOG(IPASoft, Warning)
+@@ -232,6 +234,7 @@
+ 		 * the AGC algorithm (abrupt near one edge, and very small near the
+ 		 * other) we limit the range of the gain values used.
+ 		 */
++		context_.configuration.agc.againMin = againMin;
+ 		context_.configuration.agc.againMax = againMax;
+ 		if (!againMin) {
+ 			LOG(IPASoft, Warning)
+@@ -242,6 +245,15 @@
+ 		context_.configuration.agc.againMinStep = 1.0;
+ 	}
+ 
++	auto digital = sensorInfoMap_.find(V4L2_CID_DIGITAL_GAIN);
++	if (useDigitalGain_ && digital != sensorInfoMap_.end()) {
++		const int32_t unity = digital->second.def().get<int32_t>();
++		context_.configuration.agc.digitalGainMin = unity;
++		/* Limit shadow amplification to the tested 4× sensor gain. */
++		context_.configuration.agc.digitalGainMax =
++			std::min(unity * 4, digital->second.max().get<int32_t>());
++	}
++
+ 	for (auto const &algo : algorithms()) {
+ 		int ret = algo->configure(context_, configInfo);
+ 		if (ret)
+@@ -294,6 +306,12 @@
+ 		sensorControls.get(V4L2_CID_EXPOSURE).get<int32_t>();
+ 	int32_t again = sensorControls.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>();
+ 	frameContext.sensor.gain = camHelper_ ? camHelper_->gain(again) : again;
++	const auto &agc = context_.configuration.agc;
++	frameContext.sensor.digitalGain = agc.digitalGainMin;
++	if (sensorControls.contains(V4L2_CID_DIGITAL_GAIN))
++		frameContext.sensor.digitalGain = std::clamp(
++			sensorControls.get(V4L2_CID_DIGITAL_GAIN).get<int32_t>(),
++			agc.digitalGainMin, agc.digitalGainMax);
+ 
+ 	/*
+ 	 * Software ISP currently does not produce any metadata. Use an empty
+@@ -319,6 +337,9 @@
+ 	ctrls.set(V4L2_CID_ANALOGUE_GAIN,
+ 		  static_cast<int32_t>(camHelper_ ? camHelper_->gainCode(againNew) : againNew));
+ 
++	if (agc.digitalGainMax > agc.digitalGainMin)
++		ctrls.set(V4L2_CID_DIGITAL_GAIN, frameContext.sensor.digitalGain);
++
+ 	setSensorControls.emit(ctrls);
+ }
+ 

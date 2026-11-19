@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: CC0-1.0
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      # Measured test-pattern pedestal: 64 on the 10-bit sensor,
+      # normalized to the IPA's 16-bit tuning scale.
+      blackLevel: 4096
+  - Awb:
+  - Lut:
+  - Agc:
+...
